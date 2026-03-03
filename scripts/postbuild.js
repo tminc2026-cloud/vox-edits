@@ -41,6 +41,10 @@ for (const htmlFile of ['popup.html', 'sidebar.html']) {
   let html = readFileSync(htmlPath, 'utf-8');
   // Remove crossorigin attribute (not needed for extension pages)
   html = html.replace(/ crossorigin/g, '');
+  // Normalize absolute script/link src paths to relative (strip leading slash)
+  // Safety net in case Vite emits /popup.js instead of ./popup.js
+  html = html.replace(/(<script\b[^>]*\ssrc=")\/([^"]+)"/g, '$1$2"');
+  html = html.replace(/(<link\b[^>]*\shref=")\/([^"]+)"/g, '$1$2"');
   writeFileSync(htmlPath, html, 'utf-8');
   console.log(`Patched ${htmlFile}`);
 }
