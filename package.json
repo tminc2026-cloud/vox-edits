@@ -1,0 +1,13 @@
+{
+  "name": "voxedit",
+  "version": "1.0.0",
+  "description": "VoxEdit – Voice annotations for Google Docs",
+  "type": "module",
+  "scripts": {
+    "build": "vite build && vite build --config vite.content.config.js && node scripts/postbuild.js",
+    "watch": "vite build --watch"
+  },
+  "devDependencies": {
+    "vite": "^5.0.0"
+  }
+}
