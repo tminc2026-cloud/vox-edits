@@ -32,8 +32,8 @@
   },
   "web_accessible_resources": [
     {
-      "resources": ["sidebar.html"],
-      "matches": ["https://docs.google.com/document/*"]
+      "resources": ["sidebar.html", "sidebar.js"],
+      "matches": ["<all_urls>"]
     }
   ]
 }
