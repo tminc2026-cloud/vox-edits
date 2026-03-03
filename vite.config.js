@@ -6,6 +6,9 @@ import { defineConfig } from 'vite';
 import { resolve } from 'path';
 
 export default defineConfig({
+  // Use relative base so built HTML files reference assets with relative paths
+  // (required for chrome-extension:// URLs regardless of load directory)
+  base: './',
   // Treat src/ as Vite's project root so HTML paths are resolved correctly
   root: resolve(__dirname, 'src'),
   build: {
