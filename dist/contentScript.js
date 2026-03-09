@@ -15,41 +15,37 @@
     let sidebarFrame = null;
     let overlayRoot = null;
     let mutationObserver = null;
-    let mutationThrottleTimer = null;
+    let mutationDebounceTimer = null;
+    let renderScheduled = false;
     try {
-      chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
+      chrome.runtime.onMessage.addListener(function(message, _sender, sendResponse) {
         const { type } = message || {};
         if (!type) return false;
-        if (type === "PING") {
-          sendResponse({ type: "PONG" });
-          return false;
-        }
-        if (type === "TOGGLE_SIDEBAR") {
-          toggleSidebar();
-          sendResponse({ ok: true });
-          return false;
-        }
-        if (type === "GET_SELECTION") {
-          sendResponse({ ok: true, selection: currentSelection });
-          return false;
-        }
-        if (type === "RENDER_ANNOTATION") {
-          const { annotation } = message;
-          if (annotation) {
-            addOrUpdateAnnotation(annotation);
-            renderAllOverlays();
-          }
-          sendResponse({ ok: true });
-          return false;
-        }
-        if (type === "DELETE_ANNOTATION") {
-          const { annotationId } = message;
-          if (annotationId) {
-            annotations = annotations.filter((a) => a.id !== annotationId);
-            renderAllOverlays();
-          }
-          sendResponse({ ok: true });
-          return false;
+        switch (type) {
+          case "PING":
+            sendResponse({ type: "PONG" });
+            return false;
+          case "TOGGLE_SIDEBAR":
+            toggleSidebar();
+            sendResponse({ ok: true });
+            return false;
+          case "GET_SELECTION":
+            sendResponse({ ok: true, selection: currentSelection });
+            return false;
+          case "RENDER_ANNOTATION":
+            if (message.annotation) {
+              addOrUpdateAnnotation(message.annotation);
+              scheduleRender();
+            }
+            sendResponse({ ok: true });
+            return false;
+          case "DELETE_ANNOTATION":
+            if (message.annotationId) {
+              annotations = annotations.filter((a) => a.id !== message.annotationId);
+              scheduleRender();
+            }
+            sendResponse({ ok: true });
+            return false;
         }
         return false;
       });
@@ -65,14 +61,12 @@
         return;
       }
       let attempts = 0;
-      const maxAttempts = 60;
-      const intervalId = setInterval(() => {
-        attempts++;
+      const id = setInterval(() => {
         if (isEditorFrame()) {
-          clearInterval(intervalId);
+          clearInterval(id);
           init();
-        } else if (attempts >= maxAttempts) {
-          clearInterval(intervalId);
+        } else if (++attempts >= 60) {
+          clearInterval(id);
           log("Editor frame not found after 30 s – not activating in this frame.");
         }
       }, 500);
@@ -82,16 +76,33 @@
       log("Editor frame detected – initialising VoxEdit.");
       createOverlayRoot();
       setupSelectionListener();
-      setupMutationObserver();
       setupScrollResizeListeners();
       await loadAndRestoreAnnotations();
+      setupMutationObserver();
     }
     function getDocId() {
       const match = window.location.pathname.match(/\/document\/d\/([^/]+)/);
       return match ? match[1] : null;
     }
+    function getScrollOffsets() {
+      const editor = document.querySelector(".kix-appview-editor");
+      if (editor) {
+        let el = editor.parentElement;
+        while (el && el !== document.body) {
+          if (el.scrollTop > 0 || el.scrollLeft > 0) {
+            return { scrollX: el.scrollLeft, scrollY: el.scrollTop };
+          }
+          el = el.parentElement;
+        }
+      }
+      return { scrollX: window.scrollX || 0, scrollY: window.scrollY || 0 };
+    }
     function createOverlayRoot() {
-      if (document.getElementById("voxedit-overlay-root")) return;
+      const existing = document.getElementById("voxedit-overlay-root");
+      if (existing) {
+        overlayRoot = existing;
+        return;
+      }
       overlayRoot = document.createElement("div");
       overlayRoot.id = "voxedit-overlay-root";
       Object.assign(overlayRoot.style, {
@@ -114,6 +125,39 @@
         timer = setTimeout(() => fn.apply(this, args), delay);
       };
     }
+    function scheduleRender() {
+      if (renderScheduled) return;
+      renderScheduled = true;
+      requestAnimationFrame(() => {
+        renderScheduled = false;
+        renderAllOverlays();
+      });
+    }
+    function extractContext(range) {
+      const CONTEXT_LEN = 80;
+      const editor = document.querySelector(".kix-appview-editor") || document.body;
+      try {
+        const walker = document.createTreeWalker(editor, NodeFilter.SHOW_TEXT, null);
+        let fullText = "";
+        let startPos = -1;
+        let endPos = -1;
+        let node;
+        while (node = walker.nextNode()) {
+          const pos = fullText.length;
+          if (node === range.startContainer) startPos = pos + range.startOffset;
+          if (node === range.endContainer) endPos = pos + range.endOffset;
+          fullText += node.textContent;
+        }
+        if (startPos === -1) return { contextBefore: "", contextAfter: "" };
+        if (endPos === -1) endPos = fullText.length;
+        return {
+          contextBefore: fullText.slice(Math.max(0, startPos - CONTEXT_LEN), startPos),
+          contextAfter: fullText.slice(endPos, Math.min(fullText.length, endPos + CONTEXT_LEN))
+        };
+      } catch (_) {
+        return { contextBefore: "", contextAfter: "" };
+      }
+    }
     function handleSelectionChange() {
       try {
         const selection = window.getSelection();
@@ -132,46 +176,32 @@
           currentSelection = null;
           return;
         }
-        const fullText = range.startContainer.textContent || "";
-        const startOffset = range.startOffset;
-        const endOffset = range.endContainer === range.startContainer ? range.endOffset : range.startContainer.textContent.length;
-        const contextBefore = fullText.substring(
-          Math.max(0, startOffset - 50),
-          startOffset
-        );
-        const contextAfter = fullText.substring(
-          endOffset,
-          Math.min(fullText.length, endOffset + 50)
-        );
+        const { contextBefore, contextAfter } = extractContext(range);
         const clientRects = Array.from(range.getClientRects());
         if (!clientRects.length) {
           currentSelection = null;
           return;
         }
-        currentSelection = {
-          text,
-          contextBefore,
-          contextAfter,
-          rects: clientRects,
-          docId
-        };
+        const { scrollX, scrollY } = getScrollOffsets();
+        const docRects = clientRects.map((r) => ({
+          top: r.top + scrollY,
+          left: r.left + scrollX,
+          right: r.right + scrollX,
+          bottom: r.bottom + scrollY,
+          width: r.width,
+          height: r.height
+        }));
+        currentSelection = { text, contextBefore, contextAfter, rects: docRects, docId };
       } catch (e) {
         err("handleSelectionChange:", e.message);
         currentSelection = null;
       }
     }
     function setupSelectionListener() {
-      document.addEventListener(
-        "selectionchange",
-        debounce(handleSelectionChange, 150)
-      );
+      document.addEventListener("selectionchange", debounce(handleSelectionChange, 150));
     }
     function toggleSidebar() {
-      if (sidebarVisible) {
-        hideSidebar();
-      } else {
-        showSidebar();
-      }
+      sidebarVisible ? hideSidebar() : showSidebar();
     }
     function showSidebar() {
       if (sidebarFrame) {
@@ -192,7 +222,7 @@
           border: "none",
           zIndex: "2147483647",
           backgroundColor: "white",
-          boxShadow: "-2px 0 8px rgba(0,0,0,0.2)"
+          boxShadow: "-2px 0 12px rgba(0,0,0,0.15)"
         });
         document.body.appendChild(sidebarFrame);
         sidebarVisible = true;
@@ -202,79 +232,126 @@
       }
     }
     function hideSidebar() {
-      if (sidebarFrame) {
-        sidebarFrame.style.display = "none";
-      }
+      if (sidebarFrame) sidebarFrame.style.display = "none";
       sidebarVisible = false;
-      log("Sidebar hidden.");
     }
     function addOrUpdateAnnotation(annotation) {
       const idx = annotations.findIndex((a) => a.id === annotation.id);
-      if (idx >= 0) {
-        annotations[idx] = annotation;
-      } else {
-        annotations.push(annotation);
+      if (idx >= 0) annotations[idx] = annotation;
+      else annotations.push(annotation);
+    }
+    function findRectsForAnnotation(annotation) {
+      try {
+        const editor = document.querySelector(".kix-appview-editor");
+        if (!editor) return null;
+        const target = annotation.selectedText;
+        if (!target) return null;
+        const walker = document.createTreeWalker(editor, NodeFilter.SHOW_TEXT, null);
+        const segments = [];
+        let fullText = "";
+        let node;
+        while (node = walker.nextNode()) {
+          const t = node.textContent;
+          if (!t.length) continue;
+          segments.push({ node, start: fullText.length, end: fullText.length + t.length });
+          fullText += t;
+        }
+        if (!fullText || !segments.length) return null;
+        let targetStart = -1;
+        if (annotation.contextBefore) {
+          const probe = annotation.contextBefore.slice(-20) + target;
+          const probeIdx = fullText.indexOf(probe);
+          if (probeIdx !== -1) {
+            targetStart = probeIdx + probe.length - target.length;
+          }
+        }
+        if (targetStart === -1) {
+          targetStart = fullText.indexOf(target);
+        }
+        if (targetStart === -1) return null;
+        const targetEnd = targetStart + target.length;
+        const startSeg = segments.find((s) => s.start <= targetStart && s.end > targetStart);
+        const endSeg = segments.find((s) => s.start < targetEnd && s.end >= targetEnd);
+        if (!startSeg || !endSeg) return null;
+        const range = document.createRange();
+        range.setStart(startSeg.node, targetStart - startSeg.start);
+        range.setEnd(endSeg.node, targetEnd - endSeg.start);
+        const rects = Array.from(range.getClientRects());
+        return rects.length ? rects : null;
+      } catch (e) {
+        err("findRectsForAnnotation:", e.message);
+        return null;
       }
     }
     function renderAllOverlays() {
       if (!overlayRoot) return;
       overlayRoot.innerHTML = "";
+      const { scrollX, scrollY } = getScrollOffsets();
       for (const annotation of annotations) {
-        renderAnnotationOverlay(annotation);
+        renderAnnotationOverlay(annotation, scrollX, scrollY);
       }
     }
-    function renderAnnotationOverlay(annotation) {
+    function renderAnnotationOverlay(annotation, scrollX, scrollY) {
       if (!overlayRoot) return;
-      const rects = findRectsForAnnotation(annotation);
-      if (!rects || rects.length === 0) {
+      const clientRects = findRectsForAnnotation(annotation);
+      if (!clientRects || !clientRects.length) {
         annotation.orphaned = true;
         renderOrphanedBadge(annotation);
         return;
       }
       annotation.orphaned = false;
-      for (const rect of rects) {
-        const highlight = document.createElement("div");
-        highlight.className = "voxedit-highlight";
-        highlight.dataset.annotationId = annotation.id;
-        Object.assign(highlight.style, {
+      for (const rect of clientRects) {
+        const hl = document.createElement("div");
+        hl.className = "voxedit-highlight";
+        hl.dataset.annotationId = annotation.id;
+        Object.assign(hl.style, {
           position: "absolute",
-          top: `${rect.top + window.scrollY}px`,
-          left: `${rect.left + window.scrollX}px`,
+          top: `${rect.top + scrollY}px`,
+          left: `${rect.left + scrollX}px`,
           width: `${rect.width}px`,
           height: `${rect.height}px`,
-          backgroundColor: "rgba(255, 200, 0, 0.35)",
+          backgroundColor: "rgba(255, 193, 7, 0.3)",
           pointerEvents: "none",
           borderRadius: "2px"
         });
-        overlayRoot.appendChild(highlight);
+        overlayRoot.appendChild(hl);
       }
-      const firstRect = rects[0];
+      const first = clientRects[0];
+      const hasAudio = !!annotation.recordingDataUrl;
       const badge = document.createElement("div");
       badge.className = "voxedit-badge";
       badge.dataset.annotationId = annotation.id;
-      badge.title = annotation.selectedText;
+      badge.title = `VoxEdit: "${annotation.selectedText.slice(0, 50)}"`;
       Object.assign(badge.style, {
         position: "absolute",
-        top: `${firstRect.top + window.scrollY - 2}px`,
-        left: `${firstRect.right + window.scrollX + 4}px`,
-        width: "22px",
-        height: "22px",
+        top: `${first.top + scrollY - 1}px`,
+        left: `${first.right + scrollX + 6}px`,
+        width: "24px",
+        height: "24px",
         borderRadius: "50%",
-        backgroundColor: annotation.orphaned ? "#999" : "#e53935",
+        backgroundColor: hasAudio ? "#1565C0" : "#e53935",
         color: "white",
-        fontSize: "12px",
-        lineHeight: "22px",
+        fontSize: "11px",
+        lineHeight: "24px",
         textAlign: "center",
         cursor: "pointer",
         pointerEvents: "all",
         zIndex: "1000000",
         fontFamily: "Arial, sans-serif",
-        fontWeight: "bold",
-        boxShadow: "0 1px 4px rgba(0,0,0,0.3)",
-        userSelect: "none"
+        boxShadow: "0 2px 6px rgba(0,0,0,0.25)",
+        userSelect: "none",
+        transition: "transform 0.1s ease, box-shadow 0.1s ease"
       });
-      badge.textContent = annotation.recordingDataUrl ? "▶" : "🎤";
-      badge.addEventListener("click", function() {
+      badge.textContent = hasAudio ? "▶" : "🎤";
+      badge.addEventListener("mouseenter", () => {
+        badge.style.transform = "scale(1.2)";
+        badge.style.boxShadow = "0 3px 10px rgba(0,0,0,0.35)";
+      });
+      badge.addEventListener("mouseleave", () => {
+        badge.style.transform = "";
+        badge.style.boxShadow = "0 2px 6px rgba(0,0,0,0.25)";
+      });
+      badge.addEventListener("click", () => {
         showSidebar();
         if (sidebarFrame && sidebarFrame.contentWindow) {
           sidebarFrame.contentWindow.postMessage(
@@ -290,108 +367,65 @@
       const badge = document.createElement("div");
       badge.className = "voxedit-badge voxedit-orphaned";
       badge.dataset.annotationId = annotation.id;
-      badge.title = `[Orphaned] ${annotation.selectedText}`;
+      badge.title = `[Text not found] "${annotation.selectedText}"`;
       Object.assign(badge.style, {
         position: "fixed",
-        top: "50px",
-        right: "350px",
-        padding: "4px 8px",
-        backgroundColor: "#999",
+        top: "56px",
+        right: sidebarVisible ? "356px" : "16px",
+        padding: "3px 8px",
+        backgroundColor: "#9e9e9e",
         color: "white",
         fontSize: "11px",
         borderRadius: "4px",
         pointerEvents: "all",
         cursor: "pointer",
         zIndex: "1000001",
-        fontFamily: "Arial, sans-serif"
+        fontFamily: "Arial, sans-serif",
+        maxWidth: "160px",
+        overflow: "hidden",
+        textOverflow: "ellipsis",
+        whiteSpace: "nowrap"
       });
-      badge.textContent = `⚠ ${annotation.selectedText.substring(0, 20)}…`;
+      badge.textContent = `⚠ ${annotation.selectedText.slice(0, 20)}`;
       overlayRoot.appendChild(badge);
     }
-    function findRectsForAnnotation(annotation) {
-      try {
-        const editor = document.querySelector(".kix-appview-editor");
-        if (!editor) return null;
-        const target = annotation.selectedText;
-        if (!target) return null;
-        const walker = document.createTreeWalker(
-          editor,
-          NodeFilter.SHOW_TEXT,
-          null
-        );
-        let node;
-        while (node = walker.nextNode()) {
-          const nodeText = node.textContent;
-          const idx = nodeText.indexOf(target);
-          if (idx === -1) continue;
-          const before = nodeText.substring(
-            Math.max(0, idx - annotation.contextBefore.length),
-            idx
-          );
-          if (annotation.contextBefore && !before.endsWith(annotation.contextBefore.slice(-10))) {
-            continue;
-          }
-          try {
-            const range = document.createRange();
-            range.setStart(node, idx);
-            range.setEnd(node, idx + target.length);
-            const rects = Array.from(range.getClientRects());
-            if (rects.length) return rects;
-          } catch (_) {
-          }
-        }
-        return null;
-      } catch (e) {
-        err("findRectsForAnnotation:", e.message);
-        return null;
-      }
-    }
     function setupScrollResizeListeners() {
-      window.addEventListener("scroll", debounce(renderAllOverlays, 50), {
-        passive: true
-      });
-      window.addEventListener("resize", debounce(renderAllOverlays, 100), {
-        passive: true
-      });
-      window.addEventListener("message", function(event) {
-        const { type } = event.data || {};
-        if (type === "CLOSE_SIDEBAR") {
-          hideSidebar();
+      const debouncedRender = debounce(scheduleRender, 60);
+      window.addEventListener("scroll", debouncedRender, { passive: true });
+      window.addEventListener("resize", debounce(scheduleRender, 100), { passive: true });
+      const editor = document.querySelector(".kix-appview-editor");
+      if (editor) {
+        let el = editor.parentElement;
+        while (el && el !== document.body) {
+          el.addEventListener("scroll", debouncedRender, { passive: true });
+          el = el.parentElement;
         }
+      }
+      window.addEventListener("message", (event) => {
+        const { type } = event.data || {};
+        if (type === "CLOSE_SIDEBAR") hideSidebar();
       });
     }
     function setupMutationObserver() {
       const target = document.querySelector(".kix-appview-editor");
-      if (!target) {
-        log("No editor element yet – will try to set up MutationObserver later.");
-        waitForEditorThenObserve();
+      if (target) {
+        startObserving(target);
         return;
       }
-      startObserving(target);
-    }
-    function waitForEditorThenObserve() {
       let attempts = 0;
-      const intervalId = setInterval(() => {
-        attempts++;
-        const target = document.querySelector(".kix-appview-editor");
-        if (target) {
-          clearInterval(intervalId);
-          startObserving(target);
-        } else if (attempts > 60) {
-          clearInterval(intervalId);
-        }
+      const id = setInterval(() => {
+        const t = document.querySelector(".kix-appview-editor");
+        if (t) {
+          clearInterval(id);
+          startObserving(t);
+        } else if (++attempts > 60) clearInterval(id);
       }, 500);
     }
     function startObserving(target) {
-      if (mutationObserver) {
-        mutationObserver.disconnect();
-      }
-      mutationObserver = new MutationObserver(function(_mutations) {
-        if (mutationThrottleTimer) return;
-        mutationThrottleTimer = setTimeout(function() {
-          mutationThrottleTimer = null;
-          renderAllOverlays();
-        }, 250);
+      if (mutationObserver) mutationObserver.disconnect();
+      mutationObserver = new MutationObserver(() => {
+        clearTimeout(mutationDebounceTimer);
+        mutationDebounceTimer = setTimeout(scheduleRender, 300);
       });
       mutationObserver.observe(target, {
         childList: true,
@@ -399,27 +433,23 @@
         characterData: false,
         attributes: false
       });
-      log("MutationObserver started on editor element.");
+      log("MutationObserver started on .kix-appview-editor.");
     }
     async function loadAndRestoreAnnotations() {
       try {
         const docId = getDocId();
         if (!docId) {
-          log("No docId – skipping annotation restoration.");
+          log("No docId – skipping annotation restore.");
           return;
         }
-        const response = await chrome.runtime.sendMessage({
-          type: "GET_ANNOTATIONS",
-          docId
-        });
+        const response = await chrome.runtime.sendMessage({ type: "GET_ANNOTATIONS", docId });
         if (!response || !response.ok) {
-          log("GET_ANNOTATIONS failed or returned no data.");
+          log("GET_ANNOTATIONS returned no data.");
           return;
         }
-        const loaded = response.annotations || [];
-        annotations = loaded;
+        annotations = response.annotations || [];
         log(`Restored ${annotations.length} annotation(s) for doc ${docId}.`);
-        renderAllOverlays();
+        scheduleRender();
       } catch (e) {
         err("loadAndRestoreAnnotations:", e.message);
       }

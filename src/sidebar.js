@@ -102,38 +102,42 @@
   // The sidebar is an iframe; it cannot directly read the parent frame's
   // selection. We poll the content script via chrome.runtime messaging.
 
+  /**
+   * Find the Google Docs tab for currentDocId.
+   * Tries progressively broader queries so sidebar focus doesn't break lookup.
+   */
+  async function getDocsTab() {
+    const urlPattern = `https://docs.google.com/document/d/${currentDocId}/*`;
+    const queries = [
+      { url: urlPattern, active: true, currentWindow: true },
+      { url: urlPattern, active: true },
+      { url: urlPattern },
+    ];
+    for (const query of queries) {
+      try {
+        const tabs = await chrome.tabs.query(query);
+        if (tabs && tabs[0]) return tabs[0];
+      } catch (_) { /* try next */ }
+    }
+    return null;
+  }
+
   async function pollSelection() {
     if (!currentDocId) return;
 
     try {
-      // Ask the content script (in the parent tab) for current selection.
-      // We use chrome.tabs.query to find the docs tab.
-      const tabs = await chrome.tabs.query({
-        url: `https://docs.google.com/document/d/${currentDocId}/*`,
-        active: true,
-      });
-
-      // Fallback – search all matching tabs if no active match
-      let tab = tabs[0];
-      if (!tab) {
-        const allTabs = await chrome.tabs.query({
-          url: `https://docs.google.com/document/d/${currentDocId}/*`,
-        });
-        tab = allTabs[0];
-      }
-
+      const tab = await getDocsTab();
       if (!tab) return;
 
       const resp = await chrome.tabs.sendMessage(tab.id, { type: 'GET_SELECTION' });
       if (resp && resp.ok && resp.selection && resp.selection.text) {
         currentSelection = resp.selection;
         updateSelectionUI(currentSelection.text);
-      } else {
-        // Don't clear selection that is already set – user may have just
-        // clicked the sidebar without deselecting
       }
-    } catch (e) {
-      // Silence – tab may not have content script yet
+      // Intentionally don't clear existing selection when nothing is returned —
+      // the user may have clicked into the sidebar without deselecting text.
+    } catch (_) {
+      // Silence – tab may not have content script yet or is still loading
     }
   }
 
@@ -411,15 +415,23 @@
   async function init() {
     log('Sidebar initialised.');
 
-    // Extract docId from parent location (passed via URL or queried from tabs)
+    // Determine docId from the active Google Docs tab URL.
+    // Try current-window active tab first, then any active tab, then any
+    // Google Docs tab – covers edge cases where sidebar focus shifts the
+    // "active" designation away from the Docs tab.
     try {
-      // The sidebar iframe src doesn't know the docId, so we query it from the
-      // active tab's URL. This works because the extension has activeTab permission.
-      const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
-      const tab = tabs && tabs[0];
-      if (tab && tab.url) {
-        const match = tab.url.match(/\/document\/d\/([^/]+)/);
-        currentDocId = match ? match[1] : null;
+      const queries = [
+        { active: true, currentWindow: true },
+        { active: true },
+        { url: 'https://docs.google.com/document/*' },
+      ];
+      for (const query of queries) {
+        const tabs = await chrome.tabs.query(query);
+        const tab  = tabs && tabs[0];
+        if (tab && tab.url) {
+          const match = tab.url.match(/\/document\/d\/([^/]+)/);
+          if (match) { currentDocId = match[1]; break; }
+        }
       }
     } catch (e) {
       log('Could not determine docId:', e.message);

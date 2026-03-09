@@ -2,96 +2,83 @@
  * VoxEdit Content Script (IIFE / MV3)
  *
  * Injected into ALL FRAMES of https://docs.google.com/document/*
- * Only the frame that contains '.kix-appview-editor' is the real editor frame.
+ * Only the frame containing '.kix-appview-editor' is the real editor frame.
  *
- * Responsibilities:
- *  1. Register chrome.runtime.onMessage listener IMMEDIATELY (synchronous, top-level).
- *  2. Detect which frame we are in; bail early if not the editor frame.
- *  3. Detect text selection and expose it to the sidebar.
- *  4. Render overlay annotation badges (Grammarly-style, no DOM mutation).
- *  5. Handle MutationObserver for position recalculation.
- *  6. Restore annotations from storage on init.
+ * Architecture (Grammarly / DesignQA overlay pattern):
+ *  - Never mutates Google Docs DOM
+ *  - Mounts a single overlay root above the page
+ *  - Multi-node TreeWalker search survives Google Docs' fragmented text nodes
+ *  - RAF-based render scheduling coalesces rapid DOM mutations
+ *  - Detects Google Docs' custom scroll container for correct positioning
  *
  * Constraints:
- *  - No module syntax (Vite will bundle as IIFE).
- *  - No eval, no new Function.
- *  - No inline event handlers.
- *  - All chrome API calls wrapped in try/catch.
+ *  - No module syntax (Vite bundles as IIFE)
+ *  - No eval / new Function
+ *  - All chrome API calls wrapped in try/catch
  */
 
 (function VoxEditContentScript() {
   'use strict';
 
-  // ─── Guard: avoid double-injection ───────────────────────────────────────
-
+  // ─── Guard: avoid double-injection ────────────────────────────────────────
   if (window.__voxEditLoaded) return;
   window.__voxEditLoaded = true;
 
-  // ─── Logging ─────────────────────────────────────────────────────────────
-
-  function log(...args) {
-    console.log('[VoxEdit CS]', ...args);
-  }
-
-  function err(...args) {
-    console.error('[VoxEdit CS]', ...args);
-  }
+  // ─── Logging ──────────────────────────────────────────────────────────────
+  function log(...args) { console.log('[VoxEdit CS]', ...args); }
+  function err(...args) { console.error('[VoxEdit CS]', ...args); }
 
   // ─── State ────────────────────────────────────────────────────────────────
-
-  /** @type {{ id: string, selectedText: string, contextBefore: string, contextAfter: string, rects: DOMRect[], docId: string, orphaned?: boolean }[]} */
+  /** @type {Array<Object>} */
   let annotations = [];
 
-  /** @type {{ text: string, contextBefore: string, contextAfter: string, rects: DOMRect[], docId: string } | null} */
+  /** @type {Object|null} */
   let currentSelection = null;
 
-  let sidebarVisible = false;
-  let sidebarFrame = null;
-  let overlayRoot = null;
-  let mutationObserver = null;
-  let mutationThrottleTimer = null;
+  let sidebarVisible        = false;
+  let sidebarFrame          = null;
+  let overlayRoot           = null;
+  let mutationObserver      = null;
+  let mutationDebounceTimer = null;
 
-  // ─── Message listener (MUST be registered synchronously) ─────────────────
+  // RAF render coalescing — at most one render per animation frame
+  let renderScheduled = false;
 
+  // ─── Message listener (MUST be synchronous / top-level) ───────────────────
   try {
-    chrome.runtime.onMessage.addListener(function (message, sender, sendResponse) {
+    chrome.runtime.onMessage.addListener(function (message, _sender, sendResponse) {
       const { type } = message || {};
       if (!type) return false;
 
-      if (type === 'PING') {
-        sendResponse({ type: 'PONG' });
-        return false;
-      }
+      switch (type) {
+        case 'PING':
+          sendResponse({ type: 'PONG' });
+          return false;
 
-      if (type === 'TOGGLE_SIDEBAR') {
-        toggleSidebar();
-        sendResponse({ ok: true });
-        return false;
-      }
+        case 'TOGGLE_SIDEBAR':
+          toggleSidebar();
+          sendResponse({ ok: true });
+          return false;
 
-      if (type === 'GET_SELECTION') {
-        sendResponse({ ok: true, selection: currentSelection });
-        return false;
-      }
+        case 'GET_SELECTION':
+          sendResponse({ ok: true, selection: currentSelection });
+          return false;
 
-      if (type === 'RENDER_ANNOTATION') {
-        const { annotation } = message;
-        if (annotation) {
-          addOrUpdateAnnotation(annotation);
-          renderAllOverlays();
-        }
-        sendResponse({ ok: true });
-        return false;
-      }
+        case 'RENDER_ANNOTATION':
+          if (message.annotation) {
+            addOrUpdateAnnotation(message.annotation);
+            scheduleRender();
+          }
+          sendResponse({ ok: true });
+          return false;
 
-      if (type === 'DELETE_ANNOTATION') {
-        const { annotationId } = message;
-        if (annotationId) {
-          annotations = annotations.filter((a) => a.id !== annotationId);
-          renderAllOverlays();
-        }
-        sendResponse({ ok: true });
-        return false;
+        case 'DELETE_ANNOTATION':
+          if (message.annotationId) {
+            annotations = annotations.filter(a => a.id !== message.annotationId);
+            scheduleRender();
+          }
+          sendResponse({ ok: true });
+          return false;
       }
 
       return false;
@@ -101,34 +88,20 @@
   }
 
   // ─── Frame detection ──────────────────────────────────────────────────────
-  //
-  // Google Docs loads inside nested iframes. Only the frame that has the
-  // .kix-appview-editor element is the real editor. We only activate full
-  // functionality in that frame.
-
   function isEditorFrame() {
     return !!document.querySelector('.kix-appview-editor');
   }
 
-  // Give Docs time to fully initialise before we check for the editor frame.
   function waitForEditorAndInit() {
-    // If already present, init immediately.
-    if (isEditorFrame()) {
-      init();
-      return;
-    }
+    if (isEditorFrame()) { init(); return; }
 
-    // Otherwise poll briefly; Docs renders the editor after several async
-    // operations. Stop after 30 seconds to avoid leaking.
     let attempts = 0;
-    const maxAttempts = 60; // 60 × 500 ms = 30 s
-    const intervalId = setInterval(() => {
-      attempts++;
+    const id = setInterval(() => {
       if (isEditorFrame()) {
-        clearInterval(intervalId);
+        clearInterval(id);
         init();
-      } else if (attempts >= maxAttempts) {
-        clearInterval(intervalId);
+      } else if (++attempts >= 60) {
+        clearInterval(id);
         log('Editor frame not found after 30 s – not activating in this frame.');
       }
     }, 500);
@@ -137,56 +110,115 @@
   waitForEditorAndInit();
 
   // ─── Initialisation ───────────────────────────────────────────────────────
-
   async function init() {
     log('Editor frame detected – initialising VoxEdit.');
-
     createOverlayRoot();
     setupSelectionListener();
-    setupMutationObserver();
     setupScrollResizeListeners();
-
     await loadAndRestoreAnnotations();
+    setupMutationObserver();
   }
 
-  // ─── docId extraction ─────────────────────────────────────────────────────
-
+  // ─── docId ────────────────────────────────────────────────────────────────
   function getDocId() {
     const match = window.location.pathname.match(/\/document\/d\/([^/]+)/);
     return match ? match[1] : null;
   }
 
-  // ─── Overlay root ─────────────────────────────────────────────────────────
+  // ─── Scroll container detection ───────────────────────────────────────────
+  // Google Docs may scroll a custom container instead of the window.
+  // Walk up from the editor element looking for a scrolled ancestor.
+  function getScrollOffsets() {
+    const editor = document.querySelector('.kix-appview-editor');
+    if (editor) {
+      let el = editor.parentElement;
+      while (el && el !== document.body) {
+        if (el.scrollTop > 0 || el.scrollLeft > 0) {
+          return { scrollX: el.scrollLeft, scrollY: el.scrollTop };
+        }
+        el = el.parentElement;
+      }
+    }
+    return { scrollX: window.scrollX || 0, scrollY: window.scrollY || 0 };
+  }
 
+  // ─── Overlay root ─────────────────────────────────────────────────────────
   function createOverlayRoot() {
-    if (document.getElementById('voxedit-overlay-root')) return;
+    const existing = document.getElementById('voxedit-overlay-root');
+    if (existing) { overlayRoot = existing; return; }
 
     overlayRoot = document.createElement('div');
     overlayRoot.id = 'voxedit-overlay-root';
-
     Object.assign(overlayRoot.style, {
-      position: 'absolute',
-      top: '0',
-      left: '0',
-      width: '0',
-      height: '0',
-      pointerEvents: 'none',
-      zIndex: '999999',
-      overflow: 'visible',
+      position:     'absolute',
+      top:          '0',
+      left:         '0',
+      width:        '0',
+      height:       '0',
+      pointerEvents:'none',
+      zIndex:       '999999',
+      overflow:     'visible',
     });
 
     document.body.appendChild(overlayRoot);
     log('Overlay root created.');
   }
 
-  // ─── Selection detection ──────────────────────────────────────────────────
-
+  // ─── Utilities ────────────────────────────────────────────────────────────
   function debounce(fn, delay) {
     let timer;
     return function (...args) {
       clearTimeout(timer);
       timer = setTimeout(() => fn.apply(this, args), delay);
     };
+  }
+
+  // Coalesce multiple render triggers into one per animation frame
+  function scheduleRender() {
+    if (renderScheduled) return;
+    renderScheduled = true;
+    requestAnimationFrame(() => {
+      renderScheduled = false;
+      renderAllOverlays();
+    });
+  }
+
+  // ─── Selection detection ──────────────────────────────────────────────────
+
+  /**
+   * Extract surrounding context text for a Range by walking all text nodes.
+   * Handles multi-node selections that span Google Docs' fragmented text nodes.
+   *
+   * @param {Range} range
+   * @returns {{ contextBefore: string, contextAfter: string }}
+   */
+  function extractContext(range) {
+    const CONTEXT_LEN = 80;
+    const editor = document.querySelector('.kix-appview-editor') || document.body;
+    try {
+      const walker = document.createTreeWalker(editor, NodeFilter.SHOW_TEXT, null);
+      let fullText = '';
+      let startPos = -1;
+      let endPos   = -1;
+      let node;
+
+      while ((node = walker.nextNode())) {
+        const pos = fullText.length;
+        if (node === range.startContainer) startPos = pos + range.startOffset;
+        if (node === range.endContainer)   endPos   = pos + range.endOffset;
+        fullText += node.textContent;
+      }
+
+      if (startPos === -1) return { contextBefore: '', contextAfter: '' };
+      if (endPos   === -1) endPos = fullText.length;
+
+      return {
+        contextBefore: fullText.slice(Math.max(0, startPos - CONTEXT_LEN), startPos),
+        contextAfter:  fullText.slice(endPos, Math.min(fullText.length, endPos + CONTEXT_LEN)),
+      };
+    } catch (_) {
+      return { contextBefore: '', contextAfter: '' };
+    }
   }
 
   function handleSelectionChange() {
@@ -198,50 +230,29 @@
       }
 
       const range = selection.getRangeAt(0);
-      const text = selection.toString().trim();
-      if (!text) {
-        currentSelection = null;
-        return;
-      }
+      const text  = selection.toString().trim();
+      if (!text) { currentSelection = null; return; }
 
       const docId = getDocId();
-      if (!docId) {
-        currentSelection = null;
-        return;
-      }
+      if (!docId) { currentSelection = null; return; }
 
-      // Surrounding context for later re-anchoring
-      const fullText =
-        range.startContainer.textContent || '';
-      const startOffset = range.startOffset;
-      const endOffset =
-        range.endContainer === range.startContainer
-          ? range.endOffset
-          : range.startContainer.textContent.length;
-
-      const contextBefore = fullText.substring(
-        Math.max(0, startOffset - 50),
-        startOffset
-      );
-      const contextAfter = fullText.substring(
-        endOffset,
-        Math.min(fullText.length, endOffset + 50)
-      );
-
-      // DOMRect array for multi-line support
+      const { contextBefore, contextAfter } = extractContext(range);
       const clientRects = Array.from(range.getClientRects());
-      if (!clientRects.length) {
-        currentSelection = null;
-        return;
-      }
+      if (!clientRects.length) { currentSelection = null; return; }
 
-      currentSelection = {
-        text,
-        contextBefore,
-        contextAfter,
-        rects: clientRects,
-        docId,
-      };
+      const { scrollX, scrollY } = getScrollOffsets();
+
+      // Convert viewport rects → document-relative for durable storage
+      const docRects = clientRects.map(r => ({
+        top:    r.top    + scrollY,
+        left:   r.left   + scrollX,
+        right:  r.right  + scrollX,
+        bottom: r.bottom + scrollY,
+        width:  r.width,
+        height: r.height,
+      }));
+
+      currentSelection = { text, contextBefore, contextAfter, rects: docRects, docId };
     } catch (e) {
       err('handleSelectionChange:', e.message);
       currentSelection = null;
@@ -249,21 +260,11 @@
   }
 
   function setupSelectionListener() {
-    document.addEventListener(
-      'selectionchange',
-      debounce(handleSelectionChange, 150)
-    );
+    document.addEventListener('selectionchange', debounce(handleSelectionChange, 150));
   }
 
-  // ─── Sidebar ─────────────────────────────────────────────────────────────
-
-  function toggleSidebar() {
-    if (sidebarVisible) {
-      hideSidebar();
-    } else {
-      showSidebar();
-    }
-  }
+  // ─── Sidebar ──────────────────────────────────────────────────────────────
+  function toggleSidebar() { sidebarVisible ? hideSidebar() : showSidebar(); }
 
   function showSidebar() {
     if (sidebarFrame) {
@@ -271,24 +272,21 @@
       sidebarVisible = true;
       return;
     }
-
     try {
       sidebarFrame = document.createElement('iframe');
       sidebarFrame.id = 'voxedit-sidebar-frame';
       sidebarFrame.src = chrome.runtime.getURL('sidebar.html');
-
       Object.assign(sidebarFrame.style, {
-        position: 'fixed',
-        top: '0',
-        right: '0',
-        width: '340px',
-        height: '100%',
-        border: 'none',
-        zIndex: '2147483647',
+        position:        'fixed',
+        top:             '0',
+        right:           '0',
+        width:           '340px',
+        height:          '100%',
+        border:          'none',
+        zIndex:          '2147483647',
         backgroundColor: 'white',
-        boxShadow: '-2px 0 8px rgba(0,0,0,0.2)',
+        boxShadow:       '-2px 0 12px rgba(0,0,0,0.15)',
       });
-
       document.body.appendChild(sidebarFrame);
       sidebarVisible = true;
       log('Sidebar shown.');
@@ -298,48 +296,108 @@
   }
 
   function hideSidebar() {
-    if (sidebarFrame) {
-      sidebarFrame.style.display = 'none';
-    }
+    if (sidebarFrame) sidebarFrame.style.display = 'none';
     sidebarVisible = false;
-    log('Sidebar hidden.');
   }
 
   // ─── Annotation management ────────────────────────────────────────────────
-
   function addOrUpdateAnnotation(annotation) {
-    const idx = annotations.findIndex((a) => a.id === annotation.id);
-    if (idx >= 0) {
-      annotations[idx] = annotation;
-    } else {
-      annotations.push(annotation);
+    const idx = annotations.findIndex(a => a.id === annotation.id);
+    if (idx >= 0) annotations[idx] = annotation;
+    else annotations.push(annotation);
+  }
+
+  // ─── Multi-node text search ───────────────────────────────────────────────
+  /**
+   * Find viewport-relative DOMRects for annotation.selectedText.
+   *
+   * Google Docs renders text across many tiny nodes (per-character or per-word).
+   * Strategy:
+   *  1. Concatenate all text nodes in .kix-appview-editor into fullText
+   *  2. Use contextBefore (last 20 chars) + target for disambiguation
+   *  3. Fall back to plain indexOf if context match fails
+   *  4. Build a cross-node Range and return its client rects
+   *
+   * @param {Object} annotation
+   * @returns {DOMRect[]|null}
+   */
+  function findRectsForAnnotation(annotation) {
+    try {
+      const editor = document.querySelector('.kix-appview-editor');
+      if (!editor) return null;
+
+      const target = annotation.selectedText;
+      if (!target) return null;
+
+      // Build full editor text + per-node segment map
+      const walker = document.createTreeWalker(editor, NodeFilter.SHOW_TEXT, null);
+      const segments = [];
+      let fullText = '';
+      let node;
+
+      while ((node = walker.nextNode())) {
+        const t = node.textContent;
+        if (!t.length) continue;
+        segments.push({ node, start: fullText.length, end: fullText.length + t.length });
+        fullText += t;
+      }
+
+      if (!fullText || !segments.length) return null;
+
+      // Context-disambiguated search (last 20 chars of contextBefore + target)
+      let targetStart = -1;
+      if (annotation.contextBefore) {
+        const probe    = annotation.contextBefore.slice(-20) + target;
+        const probeIdx = fullText.indexOf(probe);
+        if (probeIdx !== -1) {
+          targetStart = probeIdx + probe.length - target.length;
+        }
+      }
+
+      // Plain search fallback
+      if (targetStart === -1) {
+        targetStart = fullText.indexOf(target);
+      }
+
+      if (targetStart === -1) return null;
+
+      const targetEnd = targetStart + target.length;
+
+      // Segments that contain the start and end offsets of the match
+      const startSeg = segments.find(s => s.start <= targetStart && s.end > targetStart);
+      const endSeg   = segments.find(s => s.start < targetEnd   && s.end >= targetEnd);
+
+      if (!startSeg || !endSeg) return null;
+
+      const range = document.createRange();
+      range.setStart(startSeg.node, targetStart - startSeg.start);
+      range.setEnd(endSeg.node,     targetEnd   - endSeg.start);
+
+      const rects = Array.from(range.getClientRects());
+      return rects.length ? rects : null;
+    } catch (e) {
+      err('findRectsForAnnotation:', e.message);
+      return null;
     }
   }
 
   // ─── Overlay rendering ────────────────────────────────────────────────────
-
   function renderAllOverlays() {
     if (!overlayRoot) return;
-
-    // Clear existing overlays
     overlayRoot.innerHTML = '';
 
+    const { scrollX, scrollY } = getScrollOffsets();
+
     for (const annotation of annotations) {
-      renderAnnotationOverlay(annotation);
+      renderAnnotationOverlay(annotation, scrollX, scrollY);
     }
   }
 
-  /**
-   * Render overlay badges for one annotation.
-   * We use context-based re-anchoring to find current position.
-   */
-  function renderAnnotationOverlay(annotation) {
+  function renderAnnotationOverlay(annotation, scrollX, scrollY) {
     if (!overlayRoot) return;
 
-    const rects = findRectsForAnnotation(annotation);
-
-    if (!rects || rects.length === 0) {
-      // Mark orphaned but don't crash
+    const clientRects = findRectsForAnnotation(annotation);
+    if (!clientRects || !clientRects.length) {
       annotation.orphaned = true;
       renderOrphanedBadge(annotation);
       return;
@@ -347,60 +405,66 @@
 
     annotation.orphaned = false;
 
-    // Render a highlight overlay for each rect (multi-line support)
-    for (const rect of rects) {
-      const highlight = document.createElement('div');
-      highlight.className = 'voxedit-highlight';
-      highlight.dataset.annotationId = annotation.id;
-
-      Object.assign(highlight.style, {
-        position: 'absolute',
-        top: `${rect.top + window.scrollY}px`,
-        left: `${rect.left + window.scrollX}px`,
-        width: `${rect.width}px`,
-        height: `${rect.height}px`,
-        backgroundColor: 'rgba(255, 200, 0, 0.35)',
-        pointerEvents: 'none',
-        borderRadius: '2px',
+    // Yellow highlight behind each line of selected text
+    for (const rect of clientRects) {
+      const hl = document.createElement('div');
+      hl.className = 'voxedit-highlight';
+      hl.dataset.annotationId = annotation.id;
+      Object.assign(hl.style, {
+        position:        'absolute',
+        top:             `${rect.top    + scrollY}px`,
+        left:            `${rect.left   + scrollX}px`,
+        width:           `${rect.width}px`,
+        height:          `${rect.height}px`,
+        backgroundColor: 'rgba(255, 193, 7, 0.3)',
+        pointerEvents:   'none',
+        borderRadius:    '2px',
       });
-
-      overlayRoot.appendChild(highlight);
+      overlayRoot.appendChild(hl);
     }
 
-    // Render a clickable badge at the right edge of the first rect
-    const firstRect = rects[0];
-    const badge = document.createElement('div');
+    // Clickable circular badge at right edge of first rect
+    const first    = clientRects[0];
+    const hasAudio = !!annotation.recordingDataUrl;
+    const badge    = document.createElement('div');
     badge.className = 'voxedit-badge';
     badge.dataset.annotationId = annotation.id;
-    badge.title = annotation.selectedText;
+    badge.title = `VoxEdit: "${annotation.selectedText.slice(0, 50)}"`;
 
     Object.assign(badge.style, {
-      position: 'absolute',
-      top: `${firstRect.top + window.scrollY - 2}px`,
-      left: `${firstRect.right + window.scrollX + 4}px`,
-      width: '22px',
-      height: '22px',
-      borderRadius: '50%',
-      backgroundColor: annotation.orphaned ? '#999' : '#e53935',
-      color: 'white',
-      fontSize: '12px',
-      lineHeight: '22px',
-      textAlign: 'center',
-      cursor: 'pointer',
-      pointerEvents: 'all',
-      zIndex: '1000000',
-      fontFamily: 'Arial, sans-serif',
-      fontWeight: 'bold',
-      boxShadow: '0 1px 4px rgba(0,0,0,0.3)',
-      userSelect: 'none',
+      position:        'absolute',
+      top:             `${first.top   + scrollY - 1}px`,
+      left:            `${first.right + scrollX + 6}px`,
+      width:           '24px',
+      height:          '24px',
+      borderRadius:    '50%',
+      backgroundColor: hasAudio ? '#1565C0' : '#e53935',
+      color:           'white',
+      fontSize:        '11px',
+      lineHeight:      '24px',
+      textAlign:       'center',
+      cursor:          'pointer',
+      pointerEvents:   'all',
+      zIndex:          '1000000',
+      fontFamily:      'Arial, sans-serif',
+      boxShadow:       '0 2px 6px rgba(0,0,0,0.25)',
+      userSelect:      'none',
+      transition:      'transform 0.1s ease, box-shadow 0.1s ease',
     });
 
-    badge.textContent = annotation.recordingDataUrl ? '▶' : '🎤';
+    badge.textContent = hasAudio ? '▶' : '🎤';
 
-    // Click: show sidebar and highlight this annotation
-    badge.addEventListener('click', function () {
+    badge.addEventListener('mouseenter', () => {
+      badge.style.transform = 'scale(1.2)';
+      badge.style.boxShadow = '0 3px 10px rgba(0,0,0,0.35)';
+    });
+    badge.addEventListener('mouseleave', () => {
+      badge.style.transform = '';
+      badge.style.boxShadow = '0 2px 6px rgba(0,0,0,0.25)';
+    });
+
+    badge.addEventListener('click', () => {
       showSidebar();
-      // Tell sidebar to show this annotation
       if (sidebarFrame && sidebarFrame.contentWindow) {
         sidebarFrame.contentWindow.postMessage(
           { type: 'SHOW_ANNOTATION', annotationId: annotation.id },
@@ -414,189 +478,104 @@
 
   function renderOrphanedBadge(annotation) {
     if (!overlayRoot) return;
-
-    // Render a small grey indicator in a fixed position at the left margin
     const badge = document.createElement('div');
     badge.className = 'voxedit-badge voxedit-orphaned';
     badge.dataset.annotationId = annotation.id;
-    badge.title = `[Orphaned] ${annotation.selectedText}`;
+    badge.title = `[Text not found] "${annotation.selectedText}"`;
 
     Object.assign(badge.style, {
-      position: 'fixed',
-      top: '50px',
-      right: '350px',
-      padding: '4px 8px',
-      backgroundColor: '#999',
-      color: 'white',
-      fontSize: '11px',
-      borderRadius: '4px',
-      pointerEvents: 'all',
-      cursor: 'pointer',
-      zIndex: '1000001',
-      fontFamily: 'Arial, sans-serif',
+      position:        'fixed',
+      top:             '56px',
+      right:           sidebarVisible ? '356px' : '16px',
+      padding:         '3px 8px',
+      backgroundColor: '#9e9e9e',
+      color:           'white',
+      fontSize:        '11px',
+      borderRadius:    '4px',
+      pointerEvents:   'all',
+      cursor:          'pointer',
+      zIndex:          '1000001',
+      fontFamily:      'Arial, sans-serif',
+      maxWidth:        '160px',
+      overflow:        'hidden',
+      textOverflow:    'ellipsis',
+      whiteSpace:      'nowrap',
     });
 
-    badge.textContent = `⚠ ${annotation.selectedText.substring(0, 20)}…`;
+    badge.textContent = `⚠ ${annotation.selectedText.slice(0, 20)}`;
     overlayRoot.appendChild(badge);
   }
 
-  /**
-   * Try to find current DOMRects for an annotation using context matching.
-   * Since Google Docs re-renders aggressively, we search for the text
-   * within .kix-appview-editor using a TreeWalker.
-   *
-   * @param {Object} annotation
-   * @returns {DOMRect[] | null}
-   */
-  function findRectsForAnnotation(annotation) {
-    try {
-      const editor = document.querySelector('.kix-appview-editor');
-      if (!editor) return null;
-
-      const target = annotation.selectedText;
-      if (!target) return null;
-
-      // Walk text nodes looking for the target text preceded by contextBefore
-      const walker = document.createTreeWalker(
-        editor,
-        NodeFilter.SHOW_TEXT,
-        null
-      );
-
-      let node;
-      while ((node = walker.nextNode())) {
-        const nodeText = node.textContent;
-        const idx = nodeText.indexOf(target);
-        if (idx === -1) continue;
-
-        // Validate context before
-        const before = nodeText.substring(
-          Math.max(0, idx - annotation.contextBefore.length),
-          idx
-        );
-        if (
-          annotation.contextBefore &&
-          !before.endsWith(annotation.contextBefore.slice(-10))
-        ) {
-          continue;
-        }
-
-        // Found match – create a range and get client rects
-        try {
-          const range = document.createRange();
-          range.setStart(node, idx);
-          range.setEnd(node, idx + target.length);
-          const rects = Array.from(range.getClientRects());
-          if (rects.length) return rects;
-        } catch (_) {
-          // Ignore – node may have been detached
-        }
-      }
-
-      return null;
-    } catch (e) {
-      err('findRectsForAnnotation:', e.message);
-      return null;
-    }
-  }
-
   // ─── Scroll / resize repositioning ───────────────────────────────────────
-
   function setupScrollResizeListeners() {
-    window.addEventListener('scroll', debounce(renderAllOverlays, 50), {
-      passive: true,
-    });
-    window.addEventListener('resize', debounce(renderAllOverlays, 100), {
-      passive: true,
-    });
+    const debouncedRender = debounce(scheduleRender, 60);
+    window.addEventListener('scroll', debouncedRender, { passive: true });
+    window.addEventListener('resize', debounce(scheduleRender, 100), { passive: true });
 
-    // Handle CLOSE_SIDEBAR message from the sidebar iframe
-    window.addEventListener('message', function (event) {
-      const { type } = event.data || {};
-      if (type === 'CLOSE_SIDEBAR') {
-        hideSidebar();
+    // Also listen on Google Docs' custom scroll container
+    const editor = document.querySelector('.kix-appview-editor');
+    if (editor) {
+      let el = editor.parentElement;
+      while (el && el !== document.body) {
+        el.addEventListener('scroll', debouncedRender, { passive: true });
+        el = el.parentElement;
       }
+    }
+
+    // Messages from sidebar iframe
+    window.addEventListener('message', (event) => {
+      const { type } = event.data || {};
+      if (type === 'CLOSE_SIDEBAR') hideSidebar();
     });
   }
 
   // ─── MutationObserver ─────────────────────────────────────────────────────
-
   function setupMutationObserver() {
     const target = document.querySelector('.kix-appview-editor');
-    if (!target) {
-      log('No editor element yet – will try to set up MutationObserver later.');
-      waitForEditorThenObserve();
-      return;
-    }
+    if (target) { startObserving(target); return; }
 
-    startObserving(target);
-  }
-
-  function waitForEditorThenObserve() {
     let attempts = 0;
-    const intervalId = setInterval(() => {
-      attempts++;
-      const target = document.querySelector('.kix-appview-editor');
-      if (target) {
-        clearInterval(intervalId);
-        startObserving(target);
-      } else if (attempts > 60) {
-        clearInterval(intervalId);
-      }
+    const id = setInterval(() => {
+      const t = document.querySelector('.kix-appview-editor');
+      if (t)              { clearInterval(id); startObserving(t); }
+      else if (++attempts > 60) clearInterval(id);
     }, 500);
   }
 
   function startObserving(target) {
-    if (mutationObserver) {
-      mutationObserver.disconnect();
-    }
+    if (mutationObserver) mutationObserver.disconnect();
 
-    mutationObserver = new MutationObserver(function (_mutations) {
-      // Throttle expensive re-render – at most once per 250 ms
-      if (mutationThrottleTimer) return;
-      mutationThrottleTimer = setTimeout(function () {
-        mutationThrottleTimer = null;
-        renderAllOverlays();
-      }, 250);
+    mutationObserver = new MutationObserver(() => {
+      // 300 ms quiet period after the last mutation before re-rendering
+      clearTimeout(mutationDebounceTimer);
+      mutationDebounceTimer = setTimeout(scheduleRender, 300);
     });
 
     mutationObserver.observe(target, {
-      childList: true,
-      subtree: true,
+      childList:     true,
+      subtree:       true,
       characterData: false,
-      attributes: false,
+      attributes:    false,
     });
 
-    log('MutationObserver started on editor element.');
+    log('MutationObserver started on .kix-appview-editor.');
   }
 
   // ─── Restoration from storage ─────────────────────────────────────────────
-
   async function loadAndRestoreAnnotations() {
     try {
       const docId = getDocId();
-      if (!docId) {
-        log('No docId – skipping annotation restoration.');
-        return;
-      }
+      if (!docId) { log('No docId – skipping annotation restore.'); return; }
 
-      const response = await chrome.runtime.sendMessage({
-        type: 'GET_ANNOTATIONS',
-        docId,
-      });
+      const response = await chrome.runtime.sendMessage({ type: 'GET_ANNOTATIONS', docId });
+      if (!response || !response.ok) { log('GET_ANNOTATIONS returned no data.'); return; }
 
-      if (!response || !response.ok) {
-        log('GET_ANNOTATIONS failed or returned no data.');
-        return;
-      }
-
-      const loaded = response.annotations || [];
-      annotations = loaded;
+      annotations = response.annotations || [];
       log(`Restored ${annotations.length} annotation(s) for doc ${docId}.`);
-
-      renderAllOverlays();
+      scheduleRender();
     } catch (e) {
       err('loadAndRestoreAnnotations:', e.message);
     }
   }
+
 })();

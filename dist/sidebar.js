@@ -56,28 +56,33 @@
       }
     });
   }
+  async function getDocsTab() {
+    const urlPattern = `https://docs.google.com/document/d/${currentDocId}/*`;
+    const queries = [
+      { url: urlPattern, active: true, currentWindow: true },
+      { url: urlPattern, active: true },
+      { url: urlPattern }
+    ];
+    for (const query of queries) {
+      try {
+        const tabs = await chrome.tabs.query(query);
+        if (tabs && tabs[0]) return tabs[0];
+      } catch (_) {
+      }
+    }
+    return null;
+  }
   async function pollSelection() {
     if (!currentDocId) return;
     try {
-      const tabs = await chrome.tabs.query({
-        url: `https://docs.google.com/document/d/${currentDocId}/*`,
-        active: true
-      });
-      let tab = tabs[0];
-      if (!tab) {
-        const allTabs = await chrome.tabs.query({
-          url: `https://docs.google.com/document/d/${currentDocId}/*`
-        });
-        tab = allTabs[0];
-      }
+      const tab = await getDocsTab();
       if (!tab) return;
       const resp = await chrome.tabs.sendMessage(tab.id, { type: "GET_SELECTION" });
       if (resp && resp.ok && resp.selection && resp.selection.text) {
         currentSelection = resp.selection;
         updateSelectionUI(currentSelection.text);
-      } else {
       }
-    } catch (e) {
+    } catch (_) {
     }
   }
   function updateSelectionUI(text) {
@@ -291,11 +296,21 @@
   async function init() {
     log("Sidebar initialised.");
     try {
-      const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
-      const tab = tabs && tabs[0];
-      if (tab && tab.url) {
-        const match = tab.url.match(/\/document\/d\/([^/]+)/);
-        currentDocId = match ? match[1] : null;
+      const queries = [
+        { active: true, currentWindow: true },
+        { active: true },
+        { url: "https://docs.google.com/document/*" }
+      ];
+      for (const query of queries) {
+        const tabs = await chrome.tabs.query(query);
+        const tab = tabs && tabs[0];
+        if (tab && tab.url) {
+          const match = tab.url.match(/\/document\/d\/([^/]+)/);
+          if (match) {
+            currentDocId = match[1];
+            break;
+          }
+        }
       }
     } catch (e) {
       log("Could not determine docId:", e.message);
